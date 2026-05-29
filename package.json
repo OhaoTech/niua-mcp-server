@@ -1,11 +1,17 @@
 {
   "name": "@ohao/mcp-server",
-  "version": "0.5.1",
+  "version": "0.7.0",
   "description": "NIUA MCP Server — generate game assets from Claude Code, Cursor, and any MCP-compatible IDE",
   "main": "dist/index.js",
   "bin": {
     "niua-mcp": "dist/index.js"
   },
+  "files": [
+    "dist/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

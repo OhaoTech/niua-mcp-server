@@ -61,6 +61,7 @@ import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import { fileURLToPath } from "url";
 import { execFile } from "node:child_process";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -68,7 +69,7 @@ import { execFile } from "node:child_process";
 const API_URL = process.env.NIUA_API_URL || "https://api.niua.ohao.tech";
 const WEB_URL = "https://niua.ohao.tech";
 const CRED_PATH = path.join(os.homedir(), ".niua", "credentials.json");
-const SERVER_VERSION = "0.5.0";
+const SERVER_VERSION = "0.7.0";
 
 // Long-running generations need a fetch timeout big enough to outlast
 // the gateway. Mesh is the canonical outlier at ~6 min sync; rig can
@@ -109,11 +110,59 @@ interface GenerateProcessingResponse {
   metadata?: Record<string, unknown>;
 }
 
+/** Structured error envelope the gateway returns alongside status:"failed".
+ *  Mirrors `niua-gateway/src/http/routes/v1/errors.rs::ApiError`. The
+ *  `error` field can be a bare string (legacy) or this envelope shape;
+ *  formatGenerateError() handles both. */
+interface ErrorEnvelope {
+  code?: string;
+  message?: string;
+  doc_url?: string;
+  job_id?: string;
+}
+
 interface GenerateFailedResponse {
   status: "failed";
   job_id?: string;
-  error?: string;
+  /** Legacy string OR structured ErrorEnvelope. */
+  error?: string | ErrorEnvelope;
   message?: string;
+}
+
+/** Pull a human-readable message out of a failed-generation response.
+ *  The gateway has used three shapes over time:
+ *    - { error: "string" }
+ *    - { error: { code, message, doc_url, job_id } }
+ *    - { message: "string" }
+ *  Past MCP versions printed the second shape as "[object Object]"
+ *  because they string-interpolated the whole object. This extracts
+ *  the right message regardless of shape and tacks on the doc URL when
+ *  the structured envelope provides one. */
+/** Shape of "something that could carry an error message." Accepts any
+ *  of the GenerateResponse union members (Processing / Failed / Completed)
+ *  plus a few legacy shapes — so callers can pass whatever they have
+ *  without TypeScript fighting them on the union narrowing. */
+type ErrorishResult = {
+  status?: string;
+  error?: string | ErrorEnvelope;
+  message?: string;
+};
+
+function formatGenerateError(result: ErrorishResult): string {
+  // Structured envelope wins
+  if (result.error && typeof result.error === "object") {
+    const env = result.error;
+    const code = env.code ? `[${env.code}] ` : "";
+    const docHint = env.doc_url ? ` (see ${env.doc_url})` : "";
+    const msg = env.message ?? "unknown error";
+    return `${code}${msg}${docHint}`;
+  }
+  // Legacy string error or top-level message field
+  return (
+    (typeof result.error === "string" && result.error) ||
+    result.message ||
+    "unknown error"
+  );
 }
 
 type GenerateResponse =
@@ -542,7 +591,7 @@ server.registerTool(
       });
       if (result.status !== "completed") {
         log("tool_fail", { tool: "generate_image", status: result.status });
-        return toolError(`Image generation failed: ${("message" in result && result.message) || ("error" in result && result.error) || "unknown error"}`);
+        return toolError(`Image generation failed: ${formatGenerateError(result)}`);
       }
       const filePath = await downloadToFile(result.url, filename);
       log("tool_ok", { tool: "generate_image", ms: Date.now() - t0 });
@@ -575,30 +624,76 @@ server.registerTool(
   {
     title: "Generate music",
     description:
-      `Generate music from a text description. Returns a WAV on the CDN. Optional lyrics with [verse] / [chorus] tags. ${PRICING_HINT}`,
+      `Generate music from a text description. Returns a WAV on the CDN. ` +
+      `For instrumental tracks, omit \`lyrics\` (or pass only structural [verse]/[chorus] tags). ` +
+      `For vocal-led tracks, pass actual lyric text. Control bpm, key, time signature, ` +
+      `and vocal language for reproducible results. ${PRICING_HINT}`,
     annotations: { ...WRITE_ANNOTATIONS, title: "Generate music" },
     inputSchema: {
+      // ── Core ─────────────────────────────────────────────────
       prompt: z.string().min(1).max(2000)
-        .describe("Music description: genre, mood, instruments, tempo."),
+        .describe("Music description: genre, mood, instruments, tempo. Include structural cues here (e.g. 'soft intro, building chorus, fade-out') rather than in `lyrics` for instrumental tracks."),
       lyrics: z.string().max(4000).optional()
-        .describe("Lyrics with [verse]/[chorus] tags. Use [Instrumental] for no vocals."),
-      duration: z.number().int().min(10).max(240).optional().default(30)
-        .describe("Duration in seconds (10–240)."),
+        .describe("Vocal lyrics. Use [verse] / [chorus] / [bridge] tags inside the actual vocal text. To request an instrumental track, OMIT this field (or pass only structural tags with no lyric text — auto-detected as instrumental)."),
+      duration: z.number().int().min(5).max(240).optional().default(30)
+        .describe("Duration in seconds (5–240). Real tracks aren't tidy multiples of 5/10 — pick a value that fits the brief."),
       filename: z.string().optional().default("generated.wav")
         .describe("Output filename for the local save."),
+
+      // ── Control knobs (the missing ones the incident flagged) ─
+      seed: z.number().int().optional()
+        .describe("Deterministic seed. Same seed + same params = same output. Use for reproducible BGM."),
+      inference_steps: z.number().int().min(4).max(16).optional()
+        .describe("DiT sampling steps (4–16). Higher = better quality, slower."),
+      thinking: z.boolean().optional()
+        .describe("Enable LM chain-of-thought for stronger structural coherence (slower, better)."),
+      bpm: z.number().int().min(40).max(220).optional()
+        .describe("Tempo in BPM (40–220)."),
+      keyscale: z.string().optional()
+        .describe("Musical key + mode, e.g. 'C major', 'A minor', 'F# Dorian'."),
+      timesignature: z.enum(["3/4", "4/4", "5/4", "6/8", "7/8"]).optional()
+        .describe("Time signature."),
+      vocal_language: z.string().optional()
+        .describe("ISO 639 language code for vocals (e.g. 'en', 'ja', 'ko'). Ignored on instrumental tracks."),
+
+      // ── Audio-to-audio surface ─────────────────────────────
+      task_type: z.enum([
+        "text2music", "cover", "cover-nofsq", "repaint", "lego", "extract", "complete",
+      ]).optional().describe(
+        "Generation task. Default `text2music`. `cover`/`cover-nofsq` re-render `src_audio` toward the prompt (style transfer). `repaint` regenerates a time range of `src_audio` (set `repainting_start`/`end`). `lego` does stem mixing. `extract` recovers semantic codes. `complete` extends `src_audio` to the requested duration."
+      ),
+      src_audio: z.string().optional()
+        .describe("Source audio for audio2audio tasks. HTTPS URL or R2 key (e.g. `uploads/<user>/track.wav`). Required by every `task_type` except `text2music`."),
+      reference_audio: z.string().optional()
+        .describe("Reference audio for style transfer. URL or R2 key."),
+      audio_cover_strength: z.number().min(0).max(1).optional()
+        .describe("Cover task transformation strength (0–1). 0 = nearly unchanged, 1 = full re-render."),
+      cover_noise_strength: z.number().min(0).max(1).optional()
+        .describe("Cover noise injection strength (0–1)."),
+      repainting_start: z.number().min(0).optional()
+        .describe("Repaint start time in seconds (used by `task_type: repaint`)."),
+      repainting_end: z.number().min(0).optional()
+        .describe("Repaint end time in seconds (used by `task_type: repaint`)."),
     },
   },
-  async ({ prompt, lyrics, duration, filename }) => {
+  async (args) => {
+    const { filename = "generated.wav", ...gatewayParams } = args;
     const t0 = Date.now();
-    log("tool_call", { tool: "generate_music", duration });
+    log("tool_call", { tool: "generate_music", duration: args.duration });
     try {
+      // Forward EVERY caller-supplied param to the gateway. The gateway
+      // already validates against its ParamSpec list and returns a 400
+      // for anything out of range. Passing the whole object through
+      // means future-added params land here automatically, no MCP
+      // rebuild needed (the per-param Zod schemas are documentation /
+      // client-side guard; the gateway is the source of truth).
       const result = await niuaFetch<GenerateResponse>("/api/v1/generate/music", {
         method: "POST",
-        body: JSON.stringify({ prompt, lyrics, duration }),
+        body: JSON.stringify(gatewayParams),
       });
       if (result.status !== "completed") {
         log("tool_fail", { tool: "generate_music", status: result.status });
-        return toolError(`Music generation failed: ${("message" in result && result.message) || ("error" in result && result.error) || "unknown error"}`);
+        return toolError(`Music generation failed: ${formatGenerateError(result)}`);
       }
       const filePath = await downloadToFile(result.url, filename);
       log("tool_ok", { tool: "generate_music", ms: Date.now() - t0 });
@@ -606,7 +701,7 @@ server.registerTool(
         {
           type: "text",
           text:
-            `Music generated (${duration}s) and saved to: ${filePath}\n` +
+            `Music generated (${args.duration ?? 30}s) and saved to: ${filePath}\n` +
             `URL: ${result.url}\n` +
             `R2 key: ${result.r2_key}`,
         },
@@ -661,7 +756,7 @@ server.registerTool(
 
       if (result.status !== "completed") {
         log("tool_fail", { tool: "generate_mesh", status: result.status });
-        return toolError(`Mesh generation failed: ${("message" in result && result.message) || ("error" in result && result.error) || "unknown error"}`);
+        return toolError(`Mesh generation failed: ${formatGenerateError(result)}`);
       }
       const filePath = await downloadToFile(result.url, filename);
       log("tool_ok", { tool: "generate_mesh", ms: Date.now() - t0 });
@@ -710,7 +805,7 @@ server.registerTool(
       const result = await withProgressHeartbeat(extra, fetchPromise, "re-texturing mesh");
       if (result.status !== "completed") {
         log("tool_fail", { tool: "generate_mesh_texture", status: result.status });
-        return toolError(`Texture pass failed: ${("message" in result && result.message) || ("error" in result && result.error) || "unknown error"}`);
+        return toolError(`Texture pass failed: ${formatGenerateError(result)}`);
       }
       const filePath = await downloadToFile(result.url, filename);
       log("tool_ok", { tool: "generate_mesh_texture", ms: Date.now() - t0 });
@@ -769,7 +864,7 @@ server.registerTool(
       );
       if (result.status === "failed") {
         log("tool_fail", { tool: "generate_motion" });
-        return toolError(`Motion capture submission failed: ${result.message || result.error || "unknown error"}`);
+        return toolError(`Motion capture submission failed: ${formatGenerateError(result)}`);
       }
       log("tool_ok", { tool: "generate_motion", job_id: result.job_id, ms: Date.now() - t0 });
       return toolOk([
@@ -812,7 +907,7 @@ server.registerTool(
       });
       if (result.status !== "completed") {
         log("tool_fail", { tool: "generate_text2motion", status: result.status });
-        return toolError(`Animation generation failed: ${("message" in result && result.message) || ("error" in result && result.error) || "unknown error"}`);
+        return toolError(`Animation generation failed: ${formatGenerateError(result)}`);
       }
       const filePath = await downloadToFile(result.url, filename);
       log("tool_ok", { tool: "generate_text2motion", ms: Date.now() - t0 });
@@ -853,7 +948,7 @@ server.registerTool(
       const result = await withProgressHeartbeat(extra, fetchPromise, "rigging mesh");
       if (result.status === "failed") {
         log("tool_fail", { tool: "generate_rig" });
-        return toolError(`Rigging failed: ${result.message || result.error || "unknown error"}`);
+        return toolError(`Rigging failed: ${formatGenerateError(result)}`);
       }
       if (result.status === "processing") {
         log("tool_ok", { tool: "generate_rig", job_id: result.job_id, async: true });
@@ -963,9 +1058,36 @@ server.registerTool(
 // Surface useful read-only references via the MCP resources/read flow so
 // agents can grab them without invoking a tool (and without charging the
 // wallet). URIs:
-//   - niua://docs/quickstart    Three-step onboarding (matches /api-docs hero)
-//   - niua://pricing/live       Live PRICES feed, rendered as Markdown
-//   - niua://models/catalog     /api/v1/models snapshot, rendered as Markdown
+//   - niua://docs/agents         Long-form agent manual (this server's docs/AGENTS.md)
+//   - niua://docs/quickstart     Three-step onboarding (matches /api-docs hero)
+//   - niua://pricing/live        Live PRICES feed, rendered as Markdown
+//   - niua://models/catalog      /api/v1/models snapshot, rendered as Markdown
+//
+// Static docs (AGENTS.md and any future siblings) live under the package's
+// docs/ directory and ship with the npm package. We resolve the path
+// relative to this source file so it works both from `node dist/index.js`
+// and via `npx -y github:OhaoTech/niua-mcp-server` (the dist files keep
+// the same docs/../docs/ relative layout as the source tree).
+//
+// Read the file lazily on resource access — not at startup — so a docs
+// file missing from a bad install doesn't crash the whole server. Agents
+// reading a missing resource get a clear "doc unavailable" message.
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DOCS_DIR = path.resolve(__dirname, "..", "docs");
+
+function loadDoc(filename: string): { text: string; ok: boolean } {
+  try {
+    const full = path.join(DOCS_DIR, filename);
+    return { text: fs.readFileSync(full, "utf8"), ok: true };
+  } catch (e) {
+    return {
+      text: `Documentation file unavailable: ${filename}\n\nError: ${String(e instanceof Error ? e.message : e)}\n\nThis suggests a broken install. Try reinstalling the MCP server, or report at https://github.com/OhaoTech/niua-mcp-server/issues.`,
+      ok: false,
+    };
+  }
+}
 
 const QUICKSTART_MD = `# NIUA Quickstart
 
@@ -997,6 +1119,25 @@ const QUICKSTART_MD = `# NIUA Quickstart
 Your agent now has seven generation tools: image, music, mesh, texture,
 motion, text-to-motion, rig.
 `;
+
+server.registerResource(
+  "agents-manual",
+  "niua://docs/agents",
+  {
+    title: "NIUA Agent Manual",
+    description:
+      "Long-form guide for AI agents using NIUA: when to call NIUA, " +
+      "workflow recipes (image → mesh, music with lyrics control, etc.), " +
+      "per-modality prompt patterns, error handling, and cost-awareness " +
+      "rules. The recommended first read for any agent picking up the " +
+      "NIUA tools.",
+    mimeType: "text/markdown",
+  },
+  async (uri) => {
+    const doc = loadDoc("AGENTS.md");
+    return { contents: [{ uri: uri.href, mimeType: "text/markdown", text: doc.text }] };
+  },
+);
 
 server.registerResource(
   "quickstart",
